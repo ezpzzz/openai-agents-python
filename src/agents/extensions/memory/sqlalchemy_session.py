@@ -158,6 +158,20 @@ class SQLAlchemySession(SessionABC):
             SQLAlchemySession: An instance of SQLAlchemySession connected to the specified database.
         """
         engine_kwargs = engine_kwargs or {}
+
+        # CRITICAL FIX (2025-11-16): Disable prepared statements for pgbouncer compatibility
+        # Supabase uses pgbouncer in transaction pooling mode (port 6543), which does NOT
+        # support prepared statements. Without this fix, queries fail with:
+        # "asyncpg.exceptions.InvalidSQLStatementNameError: prepared statement does not exist"
+        # Reference: https://magicstack.github.io/asyncpg/current/api/index.html#asyncpg.connection.connect
+        # Reference: https://docs.sqlalchemy.org/en/20/dialects/postgresql.html#transaction-pooling
+        if url.startswith("postgresql"):
+            if "connect_args" not in engine_kwargs:
+                engine_kwargs["connect_args"] = {}
+            # Set statement_cache_size=0 to disable prepared statement caching
+            # This is the industry-standard solution for asyncpg + pgbouncer
+            engine_kwargs["connect_args"]["statement_cache_size"] = 0
+
         engine = create_async_engine(url, **engine_kwargs)
         return cls(session_id, engine=engine, **kwargs)
 
