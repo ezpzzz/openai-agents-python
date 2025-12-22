@@ -4,18 +4,18 @@ search:
 ---
 # 暗号化セッション
 
-`EncryptedSession` はあらゆるセッション実装に透過的な暗号化を提供し、自動で古い項目を期限切れとして扱って会話データを保護します。
+`EncryptedSession` は、任意のセッション実装に対して透過的な暗号化を提供し、古い会話データを自動的に期限切れにして安全にします。
 
-## 機能
+## 特長
 
-- **透過的な暗号化**: どんなセッションでも Fernet 暗号化でラップします
-- **セッションごとの鍵**: 一意の暗号化のために HKDF で鍵導出を行います
-- **自動期限切れ**: TTL が切れた古い項目は静かにスキップされます
-- **そのまま置き換え可能**: 既存のあらゆるセッション実装で動作します
+- **透過的な暗号化**: 任意のセッションを  Fernet  暗号化でラップします
+- **セッションごとのキー**:  HKDF  による鍵導出でセッションごとに一意の暗号化を実現します
+- **自動期限切れ**:  TTL  の有効期限が切れた古い項目は静かにスキップされます
+- **ドロップイン置き換え**: 既存のあらゆるセッション実装で動作します
 
 ## インストール
 
-暗号化セッションには `encrypt` エクストラが必要です:
+暗号化セッションには `encrypt` extra が必要です:
 
 ```bash
 pip install openai-agents[encrypt]
@@ -55,9 +55,9 @@ if __name__ == "__main__":
 
 ## 設定
 
-### 暗号鍵
+### 暗号化キー
 
-暗号鍵は Fernet キーまたは任意の文字列を使用できます:
+暗号化キーは  Fernet  キーまたは任意の文字列を使用できます:
 
 ```python
 from agents.extensions.memory import EncryptedSession
@@ -103,7 +103,7 @@ session = EncryptedSession(
 
 ## さまざまなセッションタイプでの使用
 
-### SQLite セッションでの使用
+###  SQLite  セッションでの使用
 
 ```python
 from agents import SQLiteSession
@@ -119,7 +119,7 @@ session = EncryptedSession(
 )
 ```
 
-### SQLAlchemy セッションでの使用
+###  SQLAlchemy  セッションでの使用
 
 ```python
 from agents.extensions.memory import EncryptedSession, SQLAlchemySession
@@ -140,30 +140,30 @@ session = EncryptedSession(
 
 !!! warning "高度なセッション機能"
 
-    `EncryptedSession` を `AdvancedSQLiteSession` のような高度なセッション実装と併用する場合は、次に注意してください。
+    `EncryptedSession` を `AdvancedSQLiteSession` などの高度なセッション実装と組み合わせて使用する場合、次の点に注意してください。
 
-    - メッセージ内容が暗号化されるため、`find_turns_by_content()` のようなメソッドは有効に機能しません
-    - 内容ベースの検索は暗号化データ上で行われるため、その有効性は制限されます
+    - `find_turns_by_content()` のようなメソッドは、メッセージ内容が暗号化されているため効果的に機能しません
+    - 内容に基づく検索は暗号化データに対して行われるため、効果が限定されます
 
 
 
-## 鍵導出
+## キー導出
 
-EncryptedSession は HKDF ( HMAC-based Key Derivation Function ) を使用して、セッションごとに一意の暗号鍵を導出します。
+EncryptedSession は  HKDF  ( HMAC-based Key Derivation Function ) を使用して、セッションごとに一意の暗号化キーを導出します。
 
-- **マスターキー**: あなたが提供する暗号鍵
+- **マスターキー**: 提供された暗号化キー
 - **セッションソルト**: セッション ID
 - **Info 文字列**: `"agents.session-store.hkdf.v1"`
-- **出力**: 32-byte Fernet キー
+- **出力**: 32 バイトの  Fernet  キー
 
-これにより、次のことが保証されます。
-- 各セッションには一意の暗号鍵が割り当てられます
-- マスターキーなしに鍵を導出することはできません
-- 異なるセッション間でデータを復号することはできません
+これにより次が保証されます。
+- 各セッションには一意の暗号化キーがあります
+- マスターキーがなければ鍵を導出できません
+- セッション間でデータを復号することはできません
 
 ## 自動期限切れ
 
-項目が TTL を超えた場合、取得時に自動的にスキップされます。
+項目が  TTL  を超えた場合、取得時に自動的にスキップされます:
 
 ```python
 # Items older than TTL are silently ignored
@@ -175,5 +175,5 @@ result = await Runner.run(agent, "Continue conversation", session=session)
 
 ## API リファレンス
 
-- [`EncryptedSession`][agents.extensions.memory.encrypt_session.EncryptedSession] - メインクラス
+- [`EncryptedSession`][agents.extensions.memory.encrypt_session.EncryptedSession] - 主要クラス
 - [`Session`][agents.memory.session.Session] - ベースセッションプロトコル
