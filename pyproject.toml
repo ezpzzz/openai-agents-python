@@ -1,25 +1,24 @@
 [project]
 name = "openai-agents"
-version = "0.6.4"
+version = "0.13.1"
 description = "OpenAI Agents SDK"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "MIT"
 authors = [{ name = "OpenAI", email = "support@openai.com" }]
 dependencies = [
-    "openai>=2.9.0,<3",
-    "pydantic>=2.12.3, <3",
+    "openai>=2.26.0,<3",
+    "pydantic>=2.12.2, <3",
     "griffe>=1.5.6, <2",
     "typing-extensions>=4.12.2, <5",
     "requests>=2.0, <3",
     "types-requests>=2.0, <3",
-    "mcp>=1.11.0, <2; python_version >= '3.10'",
+    "mcp>=1.19.0, <2; python_version >= '3.10'",
 ]
 classifiers = [
     "Typing :: Typed",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -37,7 +36,8 @@ Repository = "https://github.com/openai/openai-agents-python"
 [project.optional-dependencies]
 voice = ["numpy>=2.2.0, <3; python_version>='3.10'", "websockets>=15.0, <16"]
 viz = ["graphviz>=0.17"]
-litellm = ["litellm>=1.67.4.post1, <2"]
+litellm = ["litellm>=1.81.0, <=1.82.6"]
+any-llm = ["any-llm-sdk>=1.11.0, <2; python_version >= '3.11'"]
 realtime = ["websockets>=15.0, <16"]
 sqlalchemy = ["SQLAlchemy>=2.0", "asyncpg>=0.29.0"]
 encrypt = ["cryptography>=45.0, <46"]
@@ -51,6 +51,7 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "pytest-mock>=3.14.0",
+    "pytest-xdist",
     "rich>=13.1.0, <14",
     "mkdocs>=1.6.0",
     "mkdocs-material>=9.6.0",
@@ -74,6 +75,7 @@ dev = [
     "dapr>=1.14.0",
     "grpcio>=1.60.0",
     "testcontainers==4.12.0", # pinned to 4.12.0 because 4.13.0 has a warning bug in wait_for_logs, see https://github.com/testcontainers/testcontainers-python/issues/874
+    "pyright==1.1.408",
 ]
 
 [tool.uv.workspace]
@@ -123,7 +125,8 @@ module = "sounddevice.*"
 ignore_missing_imports = true
 
 [tool.coverage.run]
-source = ["tests", "src/agents"]
+source = ["src/agents"]
+omit = ["tests/*"]
 
 [tool.coverage.report]
 show_missing = true
@@ -139,12 +142,14 @@ exclude_also = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
+testpaths = ["tests"]
 filterwarnings = [
     # This is a warning that is expected to happen: we have an async filter that raises an exception
     "ignore:coroutine 'test_async_input_filter_fails.<locals>.invalid_input_filter' was never awaited:RuntimeWarning",
 ]
 markers = [
     "allow_call_model_methods: mark test as allowing calls to real model implementations",
+    "serial: mark test as requiring serial execution",
 ]
 
 [tool.inline-snapshot]

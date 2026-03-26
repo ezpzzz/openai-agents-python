@@ -48,10 +48,25 @@ from ..exceptions import AgentsException, UserError
 from ..handoffs import Handoff
 from ..items import TResponseInputItem, TResponseOutputItem
 from ..model_settings import MCPToolChoice
-from ..tool import FunctionTool, Tool
+from ..tool import (
+    FunctionTool,
+    Tool,
+    ensure_function_tool_supports_responses_only_features,
+    ensure_tool_choice_supports_backend,
+)
 from .fake_id import FAKE_RESPONSES_ID
+from .reasoning_content_replay import (
+    ReasoningContentReplayContext,
+    ReasoningContentSource,
+    ShouldReplayReasoningContent,
+    default_should_replay_reasoning_content,
+)
 
-ResponseInputContentWithAudioParam = Union[ResponseInputContentParam, ResponseInputAudioParam]
+ResponseInputContentWithAudioParam = Union[
+    ResponseInputContentParam,
+    ResponseInputAudioParam,
+    dict[str, Any],
+]
 
 
 class Converter:
@@ -70,6 +85,10 @@ class Converter:
         elif tool_choice == "none":
             return "none"
         else:
+            ensure_tool_choice_supports_backend(
+                tool_choice,
+                backend_name="OpenAI Responses models",
+            )
             return {
                 "type": "function",
                 "function": {
@@ -94,18 +113,37 @@ class Converter:
         }
 
     @classmethod
-    def message_to_output_items(cls, message: ChatCompletionMessage) -> list[TResponseOutputItem]:
+    def message_to_output_items(
+        cls,
+        message: ChatCompletionMessage,
+        provider_data: dict[str, Any] | None = None,
+    ) -> list[TResponseOutputItem]:
+        """
+        Convert a ChatCompletionMessage to a list of response output items.
+
+        Args:
+            message: The chat completion message to convert
+            provider_data: Metadata indicating the source model that generated this message.
+                Contains provider-specific information like model name and response_id,
+                which is attached to output items.
+        """
         items: list[TResponseOutputItem] = []
 
-        # Check if message is agents.extentions.models.litellm_model.InternalChatCompletionMessage
+        # Check if message is agents.extensions.models.litellm_model.InternalChatCompletionMessage
         # We can't actually import it here because litellm is an optional dependency
         # So we use hasattr to check for reasoning_content and thinking_blocks
         if hasattr(message, "reasoning_content") and message.reasoning_content:
-            reasoning_item = ResponseReasoningItem(
-                id=FAKE_RESPONSES_ID,
-                summary=[Summary(text=message.reasoning_content, type="summary_text")],
-                type="reasoning",
-            )
+            reasoning_kwargs: dict[str, Any] = {
+                "id": FAKE_RESPONSES_ID,
+                "summary": [Summary(text=message.reasoning_content, type="summary_text")],
+                "type": "reasoning",
+            }
+
+            # Add provider_data if available
+            if provider_data:
+                reasoning_kwargs["provider_data"] = provider_data
+
+            reasoning_item = ResponseReasoningItem(**reasoning_kwargs)
 
             # Store thinking blocks for Anthropic compatibility
             if hasattr(message, "thinking_blocks") and message.thinking_blocks:
@@ -129,13 +167,19 @@ class Converter:
 
             items.append(reasoning_item)
 
-        message_item = ResponseOutputMessage(
-            id=FAKE_RESPONSES_ID,
-            content=[],
-            role="assistant",
-            type="message",
-            status="completed",
-        )
+        message_kwargs: dict[str, Any] = {
+            "id": FAKE_RESPONSES_ID,
+            "content": [],
+            "role": "assistant",
+            "type": "message",
+            "status": "completed",
+        }
+
+        # Add provider_data if available
+        if provider_data:
+            message_kwargs["provider_data"] = provider_data
+
+        message_item = ResponseOutputMessage(**message_kwargs)
         if message.content:
             message_item.content.append(
                 ResponseOutputText(
@@ -155,15 +199,35 @@ class Converter:
         if message.tool_calls:
             for tool_call in message.tool_calls:
                 if tool_call.type == "function":
-                    items.append(
-                        ResponseFunctionToolCall(
-                            id=FAKE_RESPONSES_ID,
-                            call_id=tool_call.id,
-                            arguments=tool_call.function.arguments,
-                            name=tool_call.function.name,
-                            type="function_call",
-                        )
-                    )
+                    # Create base function call item
+                    func_call_kwargs: dict[str, Any] = {
+                        "id": FAKE_RESPONSES_ID,
+                        "call_id": tool_call.id,
+                        "arguments": tool_call.function.arguments,
+                        "name": tool_call.function.name,
+                        "type": "function_call",
+                    }
+
+                    # Build provider_data for function call
+                    func_provider_data: dict[str, Any] = {}
+
+                    # Start with provider_data (if provided)
+                    if provider_data:
+                        func_provider_data.update(provider_data)
+
+                    # Convert Google's extra_content field data to item's provider_data field
+                    if hasattr(tool_call, "extra_content") and tool_call.extra_content:
+                        google_fields = tool_call.extra_content.get("google")
+                        if google_fields and isinstance(google_fields, dict):
+                            thought_sig = google_fields.get("thought_signature")
+                            if thought_sig:
+                                func_provider_data["thought_signature"] = thought_sig
+
+                    # Add provider_data if we have any
+                    if func_provider_data:
+                        func_call_kwargs["provider_data"] = func_provider_data
+
+                    items.append(ResponseFunctionToolCall(**func_call_kwargs))
                 elif tool_call.type == "custom":
                     pass
 
@@ -255,10 +319,14 @@ class Converter:
         all_content = cls.extract_all_content(content)
         if isinstance(all_content, str):
             return all_content
+
         out: list[ChatCompletionContentPartTextParam] = []
         for c in all_content:
-            if c.get("type") == "text":
+            c_type = cast(dict[str, Any], c).get("type")
+            if c_type == "text":
                 out.append(cast(ChatCompletionContentPartTextParam, c))
+            elif c_type == "video_url":
+                raise UserError(f"Only text content is supported here, got: {c}")
         return out
 
     @classmethod
@@ -284,12 +352,30 @@ class Converter:
                     raise UserError(
                         f"Only image URLs are supported for input_image {casted_image_param}"
                     )
+                detail = casted_image_param.get("detail", "auto")
+                if detail == "original":
+                    # Chat Completions only supports auto/low/high, so preserve the caller's
+                    # highest-fidelity intent with the closest available value.
+                    detail = "high"
                 out.append(
                     ChatCompletionContentPartImageParam(
                         type="image_url",
                         image_url={
                             "url": casted_image_param["image_url"],
-                            "detail": casted_image_param.get("detail", "auto"),
+                            "detail": detail,
+                        },
+                    )
+                )
+            elif isinstance(c, dict) and c.get("type") == "video_url":
+                video_payload = c.get("video_url")
+                if not isinstance(video_payload, dict) or not video_payload.get("url"):
+                    raise UserError(f"Only video URLs are supported for video_url {c}")
+                out.append(
+                    cast(
+                        Any,
+                        {
+                            "type": "video_url",
+                            "video_url": {"url": video_payload["url"]},
                         },
                     )
                 )
@@ -339,14 +425,20 @@ class Converter:
     def items_to_messages(
         cls,
         items: str | Iterable[TResponseInputItem],
+        model: str | None = None,
         preserve_thinking_blocks: bool = False,
         preserve_tool_output_all_content: bool = False,
+        base_url: str | None = None,
+        should_replay_reasoning_content: ShouldReplayReasoningContent | None = None,
     ) -> list[ChatCompletionMessageParam]:
         """
         Convert a sequence of 'Item' objects into a list of ChatCompletionMessageParam.
 
         Args:
             items: A string or iterable of response input items to convert
+            model: The target model to convert to. Used to restore provider-specific data
+                (e.g., Gemini thought signatures, Claude thinking blocks) when converting
+                items back to chat completion messages for the target model.
             preserve_thinking_blocks: Whether to preserve thinking blocks in tool calls
                 for reasoning models like Claude 4 Sonnet/Opus which support interleaved
                 thinking. When True, thinking blocks are reconstructed and included in
@@ -357,6 +449,12 @@ class Converter:
                 When True, all content types including images are preserved. This is useful
                 for model providers (e.g. Anthropic via LiteLLM) that support processing
                 non-text content in tool results.
+            base_url: The request base URL, if the caller knows the concrete endpoint.
+                This is used by reasoning-content replay hooks to distinguish direct
+                provider calls from proxy or gateway requests.
+            should_replay_reasoning_content: Optional hook that decides whether a
+                reasoning item should be replayed into the next assistant message as
+                `reasoning_content`.
 
         Rules:
         - EasyInputMessage or InputMessage (role=user) => ChatCompletionUserMessageParam
@@ -379,15 +477,29 @@ class Converter:
         result: list[ChatCompletionMessageParam] = []
         current_assistant_msg: ChatCompletionAssistantMessageParam | None = None
         pending_thinking_blocks: list[dict[str, str]] | None = None
+        pending_reasoning_content: str | None = None  # For DeepSeek reasoning_content
+        normalized_base_url = base_url.rstrip("/") if base_url is not None else None
 
-        def flush_assistant_message() -> None:
-            nonlocal current_assistant_msg
+        def flush_assistant_message(*, clear_pending_reasoning_content: bool = True) -> None:
+            nonlocal current_assistant_msg, pending_reasoning_content
             if current_assistant_msg is not None:
                 # The API doesn't support empty arrays for tool_calls
                 if not current_assistant_msg.get("tool_calls"):
                     del current_assistant_msg["tool_calls"]
+                    # prevents stale reasoning_content from contaminating later turns
+                    pending_reasoning_content = None
                 result.append(current_assistant_msg)
                 current_assistant_msg = None
+            elif clear_pending_reasoning_content:
+                pending_reasoning_content = None
+
+        def apply_pending_reasoning_content(
+            assistant_msg: ChatCompletionAssistantMessageParam,
+        ) -> None:
+            nonlocal pending_reasoning_content
+            if pending_reasoning_content:
+                assistant_msg["reasoning_content"] = pending_reasoning_content  # type: ignore[typeddict-unknown-key]
+                pending_reasoning_content = None
 
         def ensure_assistant_message() -> ChatCompletionAssistantMessageParam:
             nonlocal current_assistant_msg, pending_thinking_blocks
@@ -395,6 +507,8 @@ class Converter:
                 current_assistant_msg = ChatCompletionAssistantMessageParam(role="assistant")
                 current_assistant_msg["content"] = None
                 current_assistant_msg["tool_calls"] = []
+
+            apply_pending_reasoning_content(current_assistant_msg)
 
             return current_assistant_msg
 
@@ -464,7 +578,9 @@ class Converter:
 
             # 3) response output message => assistant
             elif resp_msg := cls.maybe_response_output_message(item):
-                flush_assistant_message()
+                # A reasoning item can be followed by an assistant message and then tool calls
+                # in the same turn, so preserve pending reasoning_content across this flush.
+                flush_assistant_message(clear_pending_reasoning_content=False)
                 new_asst = ChatCompletionAssistantMessageParam(role="assistant")
                 contents = resp_msg["content"]
 
@@ -486,7 +602,26 @@ class Converter:
                     combined = "\n".join(text_segments)
                     new_asst["content"] = combined
 
+                # If we have pending thinking blocks, prepend them to the content
+                # This is required for Anthropic API with interleaved thinking
+                if pending_thinking_blocks:
+                    # If there is a text content, convert it to a list to prepend thinking blocks
+                    if "content" in new_asst and isinstance(new_asst["content"], str):
+                        text_content = ChatCompletionContentPartTextParam(
+                            text=new_asst["content"], type="text"
+                        )
+                        new_asst["content"] = [text_content]
+
+                    if "content" not in new_asst or new_asst["content"] is None:
+                        new_asst["content"] = []
+
+                    # Thinking blocks MUST come before any other content
+                    # We ignore type errors because pending_thinking_blocks is not openai standard
+                    new_asst["content"] = pending_thinking_blocks + new_asst["content"]  # type: ignore
+                    pending_thinking_blocks = None  # Clear after using
+
                 new_asst["tool_calls"] = []
+                apply_pending_reasoning_content(new_asst)
                 current_assistant_msg = new_asst
 
             # 4) function/file-search calls => attach to assistant
@@ -541,6 +676,20 @@ class Converter:
                         "arguments": arguments,
                     },
                 )
+
+                # Restore provider_data back to chat completion message for non-OpenAI models
+                if "provider_data" in func_call:
+                    provider_fields = func_call["provider_data"]  # type: ignore[typeddict-item]
+                    if isinstance(provider_fields, dict):
+                        # Restore thought_signature for Gemini in Google's extra_content format
+                        if model and "gemini" in model.lower():
+                            thought_sig = provider_fields.get("thought_signature")
+
+                            if thought_sig:
+                                new_tool_call["extra_content"] = {  # type: ignore[typeddict-unknown-key]
+                                    "google": {"thought_signature": thought_sig}
+                                }
+
                 tool_calls.append(new_tool_call)
                 asst["tool_calls"] = tool_calls
             # 5) function call output => tool message
@@ -552,7 +701,15 @@ class Converter:
                 if preserve_tool_output_all_content:
                     tool_result_content = cls.extract_all_content(output_content)
                 else:
-                    tool_result_content = cls.extract_text_content(output_content)  # type: ignore[assignment]
+                    all_output_content = cls.extract_all_content(output_content)
+                    if isinstance(all_output_content, str):
+                        tool_result_content = all_output_content
+                    else:
+                        tool_result_content = [
+                            cast(ChatCompletionContentPartTextParam, c)
+                            for c in all_output_content
+                            if c.get("type") == "text"
+                        ]
                 msg: ChatCompletionToolMessageParam = {
                     "role": "tool",
                     "tool_call_id": func_output["call_id"],
@@ -571,9 +728,22 @@ class Converter:
                 # Reconstruct thinking blocks from content (text) and encrypted_content (signature)
                 content_items = reasoning_item.get("content", [])
                 encrypted_content = reasoning_item.get("encrypted_content")
-                signatures = encrypted_content.split("\n") if encrypted_content else []
 
-                if content_items and preserve_thinking_blocks:
+                item_provider_data: dict[str, Any] = reasoning_item.get("provider_data", {})  # type: ignore[assignment]
+                item_model = item_provider_data.get("model", "")
+                should_replay = False
+
+                if (
+                    model
+                    and ("claude" in model.lower() or "anthropic" in model.lower())
+                    and content_items
+                    and preserve_thinking_blocks
+                    # Items may not all originate from Claude, so we need to check for model match.
+                    # For backward compatibility, if provider_data is missing, we ignore the check.
+                    and (model == item_model or item_provider_data == {})
+                ):
+                    signatures = encrypted_content.split("\n") if encrypted_content else []
+
                     # Reconstruct thinking blocks from content and signature
                     reconstructed_thinking_blocks = []
                     for content_item in content_items:
@@ -594,7 +764,40 @@ class Converter:
                     # This preserves the original behavior
                     pending_thinking_blocks = reconstructed_thinking_blocks
 
-            # 8) If we haven't recognized it => fail or ignore
+                if model is not None:
+                    replay_context = ReasoningContentReplayContext(
+                        model=model,
+                        base_url=normalized_base_url,
+                        reasoning=ReasoningContentSource(
+                            item=reasoning_item,
+                            origin_model=item_model or None,
+                            provider_data=item_provider_data,
+                        ),
+                    )
+                    should_replay = (
+                        should_replay_reasoning_content(replay_context)
+                        if should_replay_reasoning_content is not None
+                        else default_should_replay_reasoning_content(replay_context)
+                    )
+
+                if should_replay:
+                    summary_items = reasoning_item.get("summary", [])
+                    if summary_items:
+                        reasoning_texts = []
+                        for summary_item in summary_items:
+                            if isinstance(summary_item, dict) and summary_item.get("text"):
+                                reasoning_texts.append(summary_item["text"])
+                        if reasoning_texts:
+                            pending_reasoning_content = "\n".join(reasoning_texts)
+
+            # 8) compaction items => reject for chat completions
+            elif isinstance(item, dict) and item.get("type") == "compaction":
+                raise UserError(
+                    "Compaction items are not supported for chat completions. "
+                    "Please use the Responses API to handle compaction."
+                )
+
+            # 9) If we haven't recognized it => fail or ignore
             else:
                 raise UserError(f"Unhandled item type or structure: {item}")
 
@@ -604,6 +807,10 @@ class Converter:
     @classmethod
     def tool_to_openai(cls, tool: Tool) -> ChatCompletionToolParam:
         if isinstance(tool, FunctionTool):
+            ensure_function_tool_supports_responses_only_features(
+                tool,
+                backend_name="Chat Completions-compatible models",
+            )
             return {
                 "type": "function",
                 "function": {

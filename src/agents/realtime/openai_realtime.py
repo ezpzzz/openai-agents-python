@@ -4,8 +4,10 @@ import asyncio
 import base64
 import inspect
 import json
+import math
 import os
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Annotated, Any, Callable, Literal, Union, cast
 
@@ -79,23 +81,32 @@ from openai.types.realtime.session_update_event import (
 )
 from openai.types.responses.response_prompt import ResponsePrompt
 from pydantic import Field, TypeAdapter
-from typing_extensions import assert_never
+from typing_extensions import NotRequired, TypeAlias, TypedDict, assert_never
 from websockets.asyncio.client import ClientConnection
 
 from agents.handoffs import Handoff
 from agents.prompts import Prompt
 from agents.realtime._default_tracker import ModelAudioTracker
 from agents.realtime.audio_formats import to_realtime_audio_format
-from agents.tool import FunctionTool, Tool
+from agents.tool import (
+    FunctionTool,
+    Tool,
+    ensure_function_tool_supports_responses_only_features,
+    ensure_tool_choice_supports_backend,
+)
 from agents.util._types import MaybeAwaitable
 
 from ..exceptions import UserError
 from ..logger import logger
+from ..run_context import RunContextWrapper, TContext
 from ..version import __version__
+from .agent import RealtimeAgent
 from .config import (
     RealtimeModelTracingConfig,
+    RealtimeRunConfig,
     RealtimeSessionModelSettings,
 )
+from .handoffs import realtime_handoff
 from .items import RealtimeMessageItem, RealtimeToolCallItem
 from .model import (
     RealtimeModel,
@@ -131,6 +142,16 @@ from .model_inputs import (
     RealtimeModelSendUserInput,
 )
 
+FormatInput: TypeAlias = Union[
+    str,
+    AudioPCM,
+    AudioPCMU,
+    AudioPCMA,
+    Mapping[str, Any],
+    None,
+]
+
+
 # Avoid direct imports of non-exported names by referencing via module
 OpenAIRealtimeAudioConfig = _rt_audio_config.RealtimeAudioConfig
 OpenAIRealtimeAudioInput = _rt_audio_config.RealtimeAudioConfigInput  # type: ignore[attr-defined]
@@ -138,6 +159,7 @@ OpenAIRealtimeAudioOutput = _rt_audio_config.RealtimeAudioConfigOutput  # type: 
 
 
 _USER_AGENT = f"Agents/Python {__version__}"
+DEFAULT_REALTIME_MODEL = "gpt-realtime-1.5"
 
 DEFAULT_MODEL_SETTINGS: RealtimeSessionModelSettings = {
     "voice": "ash",
@@ -171,6 +193,183 @@ AllRealtimeServerEvents = Annotated[
 ServerEventTypeAdapter: TypeAdapter[AllRealtimeServerEvents] | None = None
 
 
+@dataclass(frozen=True)
+class _PendingResponseCreate:
+    event_id: str
+    request_version: int
+    target_version: int
+    is_manual: bool
+
+
+class _ResponseCreateSequencer:
+    """Tracks local response sequencing around response.create and response.cancel."""
+
+    def __init__(self) -> None:
+        self._ongoing_response = False
+        self._response_control: Literal["free", "create_requested", "cancel_requested"] = "free"
+        self._response_create_request_version = 0
+        self._response_create_event_counter = 0
+        self._pending_request_versions: set[int] = set()
+        self._manual_response_create_versions: set[int] = set()
+        self._pending_response_create: _PendingResponseCreate | None = None
+        self._condition = asyncio.Condition()
+
+    @property
+    def ongoing_response(self) -> bool:
+        return self._ongoing_response
+
+    @property
+    def response_control(self) -> Literal["free", "create_requested", "cancel_requested"]:
+        return self._response_control
+
+    @property
+    def pending_response_create_event_id(self) -> str | None:
+        return self._pending_response_create.event_id if self._pending_response_create else None
+
+    def _next_pending_request_version(self) -> int | None:
+        return min(self._pending_request_versions) if self._pending_request_versions else None
+
+    def _auto_response_create_target_version(self, request_version: int) -> int:
+        next_manual_version = min(
+            (
+                version
+                for version in self._manual_response_create_versions
+                if version >= request_version
+            ),
+            default=None,
+        )
+        if next_manual_version is None:
+            eligible_versions = self._pending_request_versions
+        else:
+            eligible_versions = {
+                version
+                for version in self._pending_request_versions
+                if version < next_manual_version
+            }
+        return max(eligible_versions)
+
+    def set_ongoing_response_for_test(self, value: bool) -> None:
+        self._ongoing_response = value
+
+    async def set_response_control(
+        self, control: Literal["free", "create_requested", "cancel_requested"]
+    ) -> None:
+        async with self._condition:
+            self._response_control = control
+            self._condition.notify_all()
+
+    async def mark_response_created(self) -> None:
+        async with self._condition:
+            self._ongoing_response = True
+            self._pending_response_create = None
+            self._response_control = "free"
+            self._condition.notify_all()
+
+    async def mark_response_done(self) -> None:
+        async with self._condition:
+            self._ongoing_response = False
+            self._pending_response_create = None
+            self._response_control = "free"
+            self._condition.notify_all()
+
+    async def release_waiters(self) -> None:
+        async with self._condition:
+            self._ongoing_response = False
+            self._pending_response_create = None
+            self._pending_request_versions.clear()
+            self._manual_response_create_versions.clear()
+            self._response_create_request_version = 0
+            self._response_create_event_counter = 0
+            self._response_control = "free"
+            self._condition.notify_all()
+
+    async def reserve_response_create_request(self, *, manual: bool = False) -> int:
+        async with self._condition:
+            self._response_create_request_version += 1
+            request_version = self._response_create_request_version
+            self._pending_request_versions.add(request_version)
+            if manual:
+                self._manual_response_create_versions.add(request_version)
+            self._condition.notify_all()
+            return request_version
+
+    async def clear_pending_response_create(self, event_id: str | None = None) -> bool:
+        async with self._condition:
+            if (
+                self._response_control != "create_requested"
+                or self._pending_response_create is None
+            ):
+                return False
+            if event_id is not None and self._pending_response_create.event_id != event_id:
+                return False
+            # The caller only uses the no-event-id path for response.create-like
+            # server errors, so clearing here won't release unrelated requests.
+            self._pending_request_versions.discard(self._pending_response_create.request_version)
+            if self._pending_response_create.is_manual:
+                self._manual_response_create_versions.discard(
+                    self._pending_response_create.request_version
+                )
+            self._pending_response_create = None
+            self._response_control = "free"
+            self._condition.notify_all()
+            return True
+
+    async def wait_for_response_create_slot(
+        self, request_version: int, *, manual: bool = False, event_id: str | None = None
+    ) -> _PendingResponseCreate | None:
+        while True:
+            async with self._condition:
+                await self._condition.wait_for(
+                    lambda: request_version not in self._pending_request_versions
+                    or (
+                        not self._ongoing_response
+                        and self._response_control == "free"
+                        and self._next_pending_request_version() == request_version
+                    )
+                )
+                if request_version not in self._pending_request_versions:
+                    return None
+
+                self._response_control = "create_requested"
+                resolved_event_id = event_id
+                if resolved_event_id is None:
+                    self._response_create_event_counter += 1
+                    resolved_event_id = (
+                        f"agents_py_response_create_{self._response_create_event_counter}"
+                    )
+                target_version = (
+                    request_version
+                    if manual
+                    else self._auto_response_create_target_version(request_version)
+                )
+                pending = _PendingResponseCreate(
+                    event_id=resolved_event_id,
+                    request_version=request_version,
+                    target_version=target_version,
+                    is_manual=manual,
+                )
+                self._pending_response_create = pending
+                return pending
+
+    async def mark_response_create_sent(self, pending: _PendingResponseCreate) -> None:
+        async with self._condition:
+            covered_versions = {
+                version
+                for version in self._pending_request_versions
+                if version <= pending.target_version
+            }
+            self._pending_request_versions.difference_update(covered_versions)
+            self._manual_response_create_versions.difference_update(covered_versions)
+            self._condition.notify_all()
+
+    async def begin_cancel_response(self) -> bool:
+        async with self._condition:
+            if not self._ongoing_response or self._response_control == "cancel_requested":
+                return False
+            self._response_control = "cancel_requested"
+            return True
+
+
 def get_server_event_type_adapter() -> TypeAdapter[AllRealtimeServerEvents]:
     global ServerEventTypeAdapter
     if not ServerEventTypeAdapter:
@@ -178,27 +377,109 @@ def get_server_event_type_adapter() -> TypeAdapter[AllRealtimeServerEvents]:
     return ServerEventTypeAdapter
 
 
-# Note: Avoid a module-level union alias for Python 3.9 compatibility.
-# Using a union at runtime (e.g., A | B) in a type alias triggers evaluation
-# during import on 3.9. We instead inline the union in annotations below.
+async def _collect_enabled_handoffs(
+    agent: RealtimeAgent[Any], context_wrapper: RunContextWrapper[Any]
+) -> list[Handoff[Any, RealtimeAgent[Any]]]:
+    handoffs: list[Handoff[Any, RealtimeAgent[Any]]] = []
+    for handoff_item in agent.handoffs:
+        if isinstance(handoff_item, Handoff):
+            handoffs.append(handoff_item)
+        elif isinstance(handoff_item, RealtimeAgent):
+            handoffs.append(realtime_handoff(handoff_item))
+
+    async def _check_handoff_enabled(handoff_obj: Handoff[Any, RealtimeAgent[Any]]) -> bool:
+        attr = handoff_obj.is_enabled
+        if isinstance(attr, bool):
+            return attr
+        res = attr(context_wrapper, agent)
+        if inspect.isawaitable(res):
+            return await res
+        return res
+
+    results = await asyncio.gather(*(_check_handoff_enabled(h) for h in handoffs))
+    return [h for h, ok in zip(handoffs, results) if ok]
+
+
+async def _build_model_settings_from_agent(
+    *,
+    agent: RealtimeAgent[Any],
+    context_wrapper: RunContextWrapper[Any],
+    base_settings: RealtimeSessionModelSettings,
+    starting_settings: RealtimeSessionModelSettings | None,
+    run_config: RealtimeRunConfig | None,
+) -> RealtimeSessionModelSettings:
+    updated_settings = base_settings.copy()
+
+    if agent.prompt is not None:
+        updated_settings["prompt"] = agent.prompt
+
+    instructions, tools, handoffs = await asyncio.gather(
+        agent.get_system_prompt(context_wrapper),
+        agent.get_all_tools(context_wrapper),
+        _collect_enabled_handoffs(agent, context_wrapper),
+    )
+    updated_settings["instructions"] = instructions or ""
+    updated_settings["tools"] = tools or []
+    updated_settings["handoffs"] = handoffs or []
+
+    if starting_settings:
+        updated_settings.update(starting_settings)
+
+    if run_config and run_config.get("tracing_disabled", False):
+        updated_settings["tracing"] = None
+
+    return updated_settings
+
+
+class TransportConfig(TypedDict):
+    """Low-level network transport configuration."""
+
+    ping_interval: NotRequired[float | None]
+    """Time in seconds between keepalive pings sent by the client.
+    Default is usually 20.0. Set to None to disable."""
+
+    ping_timeout: NotRequired[float | None]
+    """Time in seconds to wait for a pong response before disconnecting.
+    Set to None to disable ping timeout and keep an open connection (ignore network lag)."""
+
+    handshake_timeout: NotRequired[float]
+    """Time in seconds to wait for the connection handshake to complete."""
 
 
 class OpenAIRealtimeWebSocketModel(RealtimeModel):
     """A model that uses OpenAI's WebSocket API."""
 
-    def __init__(self) -> None:
-        self.model = "gpt-realtime"  # Default model
+    def __init__(self, *, transport_config: TransportConfig | None = None) -> None:
+        self.model = DEFAULT_REALTIME_MODEL
         self._websocket: ClientConnection | None = None
         self._websocket_task: asyncio.Task[None] | None = None
+        self._response_create_tasks: set[asyncio.Task[None]] = set()
         self._listeners: list[RealtimeModelListener] = []
         self._current_item_id: str | None = None
         self._audio_state_tracker: ModelAudioTracker = ModelAudioTracker()
-        self._ongoing_response: bool = False
+        self._response_create_sequencer = _ResponseCreateSequencer()
         self._tracing_config: RealtimeModelTracingConfig | Literal["auto"] | None = None
         self._playback_tracker: RealtimePlaybackTracker | None = None
         self._created_session: OpenAISessionCreateRequest | None = None
         self._server_event_type_adapter = get_server_event_type_adapter()
         self._call_id: str | None = None
+        self._transport_config: TransportConfig | None = transport_config
+
+    @property
+    def _ongoing_response(self) -> bool:
+        return self._response_create_sequencer.ongoing_response
+
+    @_ongoing_response.setter
+    def _ongoing_response(self, value: bool) -> None:
+        self._response_create_sequencer.set_ongoing_response_for_test(value)
+
+    @property
+    def _response_control(self) -> Literal["free", "create_requested", "cancel_requested"]:
+        return self._response_create_sequencer.response_control
+
+    @property
+    def _pending_response_create_event_id(self) -> str | None:
+        return self._response_create_sequencer.pending_response_create_event_id
 
     async def connect(self, options: RealtimeModelConfig) -> None:
         """Establish a connection to the model and keep it alive."""
@@ -244,14 +525,46 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
                 raise UserError("API key is required but was not provided.")
 
             headers.update({"Authorization": f"Bearer {api_key}"})
-        self._websocket = await websockets.connect(
-            url,
-            user_agent_header=_USER_AGENT,
-            additional_headers=headers,
-            max_size=None,  # Allow any size of message
+
+        self._websocket = await self._create_websocket_connection(
+            url=url,
+            headers=headers,
+            transport_config=self._transport_config,
         )
         self._websocket_task = asyncio.create_task(self._listen_for_messages())
         await self._update_session_config(model_settings)
+
+    async def _create_websocket_connection(
+        self,
+        url: str,
+        headers: dict[str, str],
+        transport_config: TransportConfig | None = None,
+    ) -> ClientConnection:
+        """Create a WebSocket connection with the given configuration.
+
+        Args:
+            url: The WebSocket URL to connect to.
+            headers: HTTP headers to include in the connection request.
+            transport_config: Optional low-level transport configuration.
+
+        Returns:
+            A connected WebSocket client connection.
+        """
+        connect_kwargs: dict[str, Any] = {
+            "user_agent_header": _USER_AGENT,
+            "additional_headers": headers,
+            "max_size": None,  # Allow any size of message
+        }
+
+        if transport_config:
+            if "ping_interval" in transport_config:
+                connect_kwargs["ping_interval"] = transport_config["ping_interval"]
+            if "ping_timeout" in transport_config:
+                connect_kwargs["ping_timeout"] = transport_config["ping_timeout"]
+            if "handshake_timeout" in transport_config:
+                connect_kwargs["open_timeout"] = transport_config["handshake_timeout"]
+
+        return await websockets.connect(url, **connect_kwargs)
 
     async def _send_tracing_config(
         self, tracing_config: RealtimeModelTracingConfig | Literal["auto"] | None
@@ -322,13 +635,24 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
                     exception=e, context="WebSocket error in message listener"
                 )
             )
+        finally:
+            await self._cancel_response_create_tasks()
+            await self._release_response_waiters()
 
     async def send_event(self, event: RealtimeModelSendEvent) -> None:
         """Send an event to the model."""
         if isinstance(event, RealtimeModelSendRawMessage):
             converted = _ConversionHelper.try_convert_raw_message(event)
             if converted is not None:
-                await self._send_raw_message(converted)
+                if converted.type == "response.create":
+                    request_version = await self._reserve_response_create_request(manual=True)
+                    self._start_response_create(
+                        request_version,
+                        response_create=converted,
+                        manual=True,
+                    )
+                else:
+                    await self._send_raw_message(converted)
             else:
                 logger.error(f"Failed to convert raw message: {event}")
         elif isinstance(event, RealtimeModelSendUserInput):
@@ -351,10 +675,123 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
         payload = event.model_dump_json(exclude_unset=True)
         await self._websocket.send(payload)
 
+    async def _set_response_control(
+        self, control: Literal["free", "create_requested", "cancel_requested"]
+    ) -> None:
+        await self._response_create_sequencer.set_response_control(control)
+
+    async def _mark_response_created(self) -> None:
+        await self._response_create_sequencer.mark_response_created()
+
+    async def _mark_response_done(self) -> None:
+        await self._response_create_sequencer.mark_response_done()
+
+    async def _release_response_waiters(self) -> None:
+        # Connection teardown means no response.done will arrive, so local
+        # response sequencing must be released explicitly.
+        await self._response_create_sequencer.release_waiters()
+
+    async def _reserve_response_create_request(self, *, manual: bool = False) -> int:
+        return await self._response_create_sequencer.reserve_response_create_request(manual=manual)
+
+    async def _clear_pending_response_create(self, event_id: str | None = None) -> bool:
+        return await self._response_create_sequencer.clear_pending_response_create(event_id)
+
+    async def _send_response_create_when_idle(
+        self,
+        request_version: int,
+        *,
+        response_create: OpenAIResponseCreateEvent | None = None,
+        manual: bool = False,
+    ) -> None:
+        pending = await self._response_create_sequencer.wait_for_response_create_slot(
+            request_version,
+            manual=manual,
+            event_id=response_create.event_id if response_create is not None else None,
+        )
+        if pending is None:
+            return
+
+        try:
+            response_create_event = (
+                response_create.model_copy(update={"event_id": pending.event_id})
+                if response_create is not None
+                else OpenAIResponseCreateEvent(type="response.create", event_id=pending.event_id)
+            )
+            await self._send_raw_message(response_create_event)
+        except BaseException:
+            await self._clear_pending_response_create(pending.event_id)
+            raise
+
+        await self._response_create_sequencer.mark_response_create_sent(pending)
+
+    async def _send_response_create_in_background(
+        self,
+        request_version: int,
+        *,
+        response_create: OpenAIResponseCreateEvent | None = None,
+        manual: bool = False,
+    ) -> None:
+        try:
+            await self._send_response_create_when_idle(
+                request_version,
+                response_create=response_create,
+                manual=manual,
+            )
+        except asyncio.CancelledError:
+            logger.debug("Deferred response.create task was cancelled")
+        except AssertionError as exc:
+            if str(exc) != "Not connected":
+                await self._emit_event(
+                    RealtimeModelExceptionEvent(
+                        exception=exc, context="Error sending deferred response.create"
+                    )
+                )
+        except websockets.exceptions.ConnectionClosed:
+            logger.debug("Skipping deferred response.create because the websocket is closed")
+        except Exception as exc:
+            await self._emit_event(
+                RealtimeModelExceptionEvent(
+                    exception=exc, context="Error sending deferred response.create"
+                )
+            )
+
+    def _start_response_create(
+        self,
+        request_version: int,
+        *,
+        response_create: OpenAIResponseCreateEvent | None = None,
+        manual: bool = False,
+    ) -> None:
+        task = asyncio.create_task(
+            self._send_response_create_in_background(
+                request_version,
+                response_create=response_create,
+                manual=manual,
+            )
+        )
+        self._response_create_tasks.add(task)
+        task.add_done_callback(self._response_create_tasks.discard)
+
+    async def _cancel_response_create_tasks(self) -> None:
+        if not self._response_create_tasks:
+            return
+
+        current_task = asyncio.current_task()
+        tasks_to_await = []
+        for task in list(self._response_create_tasks):
+            task.cancel()
+            if task is not current_task:
+                tasks_to_await.append(task)
+
+        if tasks_to_await:
+            await asyncio.gather(*tasks_to_await, return_exceptions=True)
+
     async def _send_user_input(self, event: RealtimeModelSendUserInput) -> None:
         converted = _ConversionHelper.convert_user_input_to_item_create(event)
         await self._send_raw_message(converted)
-        await self._send_raw_message(OpenAIResponseCreateEvent(type="response.create"))
+        request_version = await self._reserve_response_create_request()
+        self._start_response_create(request_version)
 
     async def _send_audio(self, event: RealtimeModelSendAudio) -> None:
         converted = _ConversionHelper.convert_audio_to_input_audio_buffer_append(event)
@@ -381,7 +818,8 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
         await self._emit_event(RealtimeModelItemUpdatedEvent(item=tool_item))
 
         if event.start_response:
-            await self._send_raw_message(OpenAIResponseCreateEvent(type="response.create"))
+            request_version = await self._reserve_response_create_request()
+            self._start_response_create(request_version)
 
     def _get_playback_state(self) -> RealtimePlaybackState:
         if self._playback_tracker:
@@ -406,6 +844,13 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
             "elapsed_ms": None,
         }
 
+    def _get_audio_limits(self, item_id: str, item_content_index: int) -> tuple[float, int] | None:
+        audio_state = self._audio_state_tracker.get_state(item_id, item_content_index)
+        if audio_state is None:
+            return None
+        max_audio_ms = int(math.ceil(audio_state.audio_length_ms))
+        return audio_state.audio_length_ms, max_audio_ms
+
     async def _send_interrupt(self, event: RealtimeModelSendInterrupt) -> None:
         playback_state = self._get_playback_state()
         current_item_id = playback_state.get("current_item_id")
@@ -428,12 +873,18 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
                         content_index=current_item_content_index,
                     )
                 )
-                converted = _ConversionHelper.convert_interrupt(
-                    current_item_id,
-                    current_item_content_index,
-                    int(elapsed_ms),
-                )
-                await self._send_raw_message(converted)
+                max_audio_ms: int | None = None
+                audio_limits = self._get_audio_limits(current_item_id, current_item_content_index)
+                if audio_limits is not None:
+                    _, max_audio_ms = audio_limits
+                truncated_ms = max(int(elapsed_ms), 0)
+                if self._ongoing_response or max_audio_ms is None or truncated_ms < max_audio_ms:
+                    converted = _ConversionHelper.convert_interrupt(
+                        current_item_id,
+                        current_item_content_index,
+                        truncated_ms,
+                    )
+                    await self._send_raw_message(converted)
             else:
                 logger.debug(
                     "Didn't interrupt bc elapsed ms is < 0. "
@@ -532,6 +983,7 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
 
     async def close(self) -> None:
         """Close the session."""
+        await self._cancel_response_create_tasks()
         if self._websocket:
             await self._websocket.close()
             self._websocket = None
@@ -542,11 +994,26 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
             except asyncio.CancelledError:
                 pass
             self._websocket_task = None
+        else:
+            await self._release_response_waiters()
 
     async def _cancel_response(self) -> None:
-        if self._ongoing_response:
+        if not await self._response_create_sequencer.begin_cancel_response():
+            return
+
+        try:
             await self._send_raw_message(OpenAIResponseCancelEvent(type="response.cancel"))
-            self._ongoing_response = False
+        except Exception:
+            await self._set_response_control("free")
+            raise
+
+    def _error_matches_pending_response_create(self, error: Any) -> bool:
+        if error.event_id is not None:
+            return True
+
+        code = getattr(error, "code", None)
+        message = (getattr(error, "message", None) or "").lower()
+        return code == "bad_response_create" or "response.create" in message
 
     async def _handle_ws_event(self, event: dict[str, Any]):
         await self._emit_event(RealtimeModelRawServerEvent(data=event))
@@ -623,9 +1090,48 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
             last_audio = self._audio_state_tracker.get_last_audio_item()
             if last_audio is not None:
                 item_id, content_index = last_audio
+                playback_state = self._get_playback_state()
+                playback_item_id = playback_state.get("current_item_id")
+                playback_content_index = playback_state.get("current_item_content_index") or 0
+                playback_elapsed_ms = playback_state.get("elapsed_ms")
                 await self._emit_event(
                     RealtimeModelAudioInterruptedEvent(item_id=item_id, content_index=content_index)
                 )
+
+                elapsed_override = getattr(parsed, "audio_end_ms", None)
+                if elapsed_override is None or elapsed_override <= 0:
+                    effective_elapsed_ms = playback_elapsed_ms
+                else:
+                    effective_elapsed_ms = float(elapsed_override)
+
+                if playback_item_id and effective_elapsed_ms is not None:
+                    max_audio_ms: int | None = None
+                    audio_limits = self._get_audio_limits(playback_item_id, playback_content_index)
+                    if audio_limits is not None:
+                        _, max_audio_ms = audio_limits
+                    truncated_ms = max(int(round(effective_elapsed_ms)), 0)
+                    if (
+                        max_audio_ms is not None
+                        and truncated_ms >= max_audio_ms
+                        and not self._ongoing_response
+                    ):
+                        logger.debug(
+                            "Skipping truncate because playback appears complete. "
+                            f"Item id: {playback_item_id}, "
+                            f"elapsed ms: {effective_elapsed_ms}, "
+                            f"content index: {playback_content_index}, "
+                            f"audio length ms: {max_audio_ms}"
+                        )
+                    else:
+                        if max_audio_ms is not None:
+                            truncated_ms = min(truncated_ms, max_audio_ms)
+                        await self._send_raw_message(
+                            _ConversionHelper.convert_interrupt(
+                                playback_item_id,
+                                playback_content_index,
+                                truncated_ms,
+                            )
+                        )
 
                 # Reset trackers so subsequent playback state queries don't
                 # reference audio that has been interrupted client‑side.
@@ -645,14 +1151,11 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
                 )
                 if not automatic_response_cancellation_enabled:
                     await self._cancel_response()
-            # Avoid sending conversation.item.truncate here. When the session's
-            # turn_detection.interrupt_response is enabled (GA default), the server emits
-            # conversation.item.truncated after the VAD start and takes care of history updates.
         elif parsed.type == "response.created":
-            self._ongoing_response = True
+            await self._mark_response_created()
             await self._emit_event(RealtimeModelTurnStartedEvent())
         elif parsed.type == "response.done":
-            self._ongoing_response = False
+            await self._mark_response_done()
             await self._emit_event(RealtimeModelTurnEndedEvent())
         elif parsed.type == "session.created":
             await self._send_tracing_config(self._tracing_config)
@@ -660,6 +1163,12 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
         elif parsed.type == "session.updated":
             self._update_created_session(parsed.session)
         elif parsed.type == "error":
+            if (
+                not self._ongoing_response
+                and self._response_control == "create_requested"
+                and self._error_matches_pending_response_create(parsed.error)
+            ):
+                await self._clear_pending_response_create(parsed.error.event_id)
             await self._emit_event(RealtimeModelErrorEvent(error=parsed.error))
         elif parsed.type == "conversation.item.deleted":
             await self._emit_event(RealtimeModelItemDeletedEvent(item_id=parsed.item_id))
@@ -819,6 +1328,28 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
 
         return type_value if isinstance(type_value, str) else None
 
+    @staticmethod
+    def _normalize_turn_detection_config(config: object) -> object:
+        """Normalize camelCase turn detection keys to snake_case for API compatibility."""
+        if not isinstance(config, Mapping):
+            return config
+
+        normalized = dict(config)
+        key_map = {
+            "createResponse": "create_response",
+            "interruptResponse": "interrupt_response",
+            "prefixPaddingMs": "prefix_padding_ms",
+            "silenceDurationMs": "silence_duration_ms",
+            "idleTimeoutMs": "idle_timeout_ms",
+            "modelVersion": "model_version",
+        }
+        for camel_key, snake_key in key_map.items():
+            if camel_key in normalized and snake_key not in normalized:
+                normalized[snake_key] = normalized[camel_key]
+            normalized.pop(camel_key, None)
+
+        return normalized
+
     async def _update_session_config(self, model_settings: RealtimeSessionModelSettings) -> None:
         session_config = self._get_session_config(model_settings)
         await self._send_raw_message(
@@ -829,62 +1360,99 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
         self, model_settings: RealtimeSessionModelSettings
     ) -> OpenAISessionCreateRequest:
         """Get the session config."""
-        audio_input_args = {}
+        audio_input_args: dict[str, Any] = {}
+        audio_output_args: dict[str, Any] = {}
 
-        if self._call_id:
-            audio_input_args["format"] = to_realtime_audio_format(
-                model_settings.get("input_audio_format")
-            )
-        else:
-            audio_input_args["format"] = to_realtime_audio_format(
-                model_settings.get(
+        audio_config = model_settings.get("audio")
+        audio_config_mapping = audio_config if isinstance(audio_config, Mapping) else None
+        input_audio_config: Mapping[str, Any] = (
+            cast(Mapping[str, Any], audio_config_mapping.get("input", {}))
+            if audio_config_mapping
+            else {}
+        )
+        output_audio_config: Mapping[str, Any] = (
+            cast(Mapping[str, Any], audio_config_mapping.get("output", {}))
+            if audio_config_mapping
+            else {}
+        )
+
+        input_format_source: FormatInput = (
+            input_audio_config.get("format") if input_audio_config else None
+        )
+        if input_format_source is None:
+            if self._call_id:
+                input_format_source = model_settings.get("input_audio_format")
+            else:
+                input_format_source = model_settings.get(
                     "input_audio_format", DEFAULT_MODEL_SETTINGS.get("input_audio_format")
                 )
-            )
+        input_format = to_realtime_audio_format(input_format_source)
+        if input_format is not None:
+            audio_input_args["format"] = input_format
 
-        if "input_audio_noise_reduction" in model_settings:
-            audio_input_args["noise_reduction"] = model_settings.get("input_audio_noise_reduction")  # type: ignore[assignment]
+        if "noise_reduction" in input_audio_config:
+            audio_input_args["noise_reduction"] = input_audio_config.get("noise_reduction")
+        elif "input_audio_noise_reduction" in model_settings:
+            audio_input_args["noise_reduction"] = model_settings.get("input_audio_noise_reduction")
 
-        if "input_audio_transcription" in model_settings:
-            audio_input_args["transcription"] = model_settings.get("input_audio_transcription")  # type: ignore[assignment]
+        if "transcription" in input_audio_config:
+            audio_input_args["transcription"] = input_audio_config.get("transcription")
+        elif "input_audio_transcription" in model_settings:
+            audio_input_args["transcription"] = model_settings.get("input_audio_transcription")
         else:
-            audio_input_args["transcription"] = DEFAULT_MODEL_SETTINGS.get(  # type: ignore[assignment]
+            audio_input_args["transcription"] = DEFAULT_MODEL_SETTINGS.get(
                 "input_audio_transcription"
             )
 
-        if "turn_detection" in model_settings:
-            audio_input_args["turn_detection"] = model_settings.get("turn_detection")  # type: ignore[assignment]
-        else:
-            audio_input_args["turn_detection"] = DEFAULT_MODEL_SETTINGS.get("turn_detection")  # type: ignore[assignment]
-
-        audio_output_args = {
-            "voice": model_settings.get("voice", DEFAULT_MODEL_SETTINGS.get("voice")),
-        }
-
-        if self._call_id:
-            audio_output_args["format"] = to_realtime_audio_format(  # type: ignore[assignment]
-                model_settings.get("output_audio_format")
+        if "turn_detection" in input_audio_config:
+            audio_input_args["turn_detection"] = self._normalize_turn_detection_config(
+                input_audio_config.get("turn_detection")
+            )
+        elif "turn_detection" in model_settings:
+            audio_input_args["turn_detection"] = self._normalize_turn_detection_config(
+                model_settings.get("turn_detection")
             )
         else:
-            audio_output_args["format"] = to_realtime_audio_format(  # type: ignore[assignment]
-                model_settings.get(
+            audio_input_args["turn_detection"] = DEFAULT_MODEL_SETTINGS.get("turn_detection")
+
+        requested_voice = output_audio_config.get("voice") if output_audio_config else None
+        audio_output_args["voice"] = requested_voice or model_settings.get(
+            "voice", DEFAULT_MODEL_SETTINGS.get("voice")
+        )
+
+        output_format_source: FormatInput = (
+            output_audio_config.get("format") if output_audio_config else None
+        )
+        if output_format_source is None:
+            if self._call_id:
+                output_format_source = model_settings.get("output_audio_format")
+            else:
+                output_format_source = model_settings.get(
                     "output_audio_format", DEFAULT_MODEL_SETTINGS.get("output_audio_format")
                 )
-            )
+        output_format = to_realtime_audio_format(output_format_source)
+        if output_format is not None:
+            audio_output_args["format"] = output_format
 
-        if "speed" in model_settings:
-            audio_output_args["speed"] = model_settings.get("speed")  # type: ignore[assignment]
+        if "speed" in output_audio_config:
+            audio_output_args["speed"] = output_audio_config.get("speed")
+        elif "speed" in model_settings:
+            audio_output_args["speed"] = model_settings.get("speed")
+
+        output_modalities = (
+            model_settings.get("output_modalities")
+            or model_settings.get("modalities")
+            or DEFAULT_MODEL_SETTINGS.get("modalities")
+        )
 
         # Construct full session object. `type` will be excluded at serialization time for updates.
         session_create_request = OpenAISessionCreateRequest(
             type="realtime",
-            model=(model_settings.get("model_name") or self.model) or "gpt-realtime",
-            output_modalities=model_settings.get(
-                "modalities", DEFAULT_MODEL_SETTINGS.get("modalities")
-            ),
+            model=(model_settings.get("model_name") or self.model) or DEFAULT_REALTIME_MODEL,
+            output_modalities=output_modalities,
             audio=OpenAIRealtimeAudioConfig(
-                input=OpenAIRealtimeAudioInput(**audio_input_args),  # type: ignore[arg-type]
-                output=OpenAIRealtimeAudioOutput(**audio_output_args),  # type: ignore[arg-type]
+                input=OpenAIRealtimeAudioInput(**audio_input_args),
+                output=OpenAIRealtimeAudioOutput(**audio_output_args),
             ),
             tools=cast(
                 Any,
@@ -913,7 +1481,12 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
             )
 
         if "tool_choice" in model_settings:
-            session_create_request.tool_choice = cast(Any, model_settings.get("tool_choice"))
+            tool_choice = model_settings.get("tool_choice")
+            ensure_tool_choice_supports_backend(
+                tool_choice,
+                backend_name="OpenAI Responses models",
+            )
+            session_create_request.tool_choice = cast(Any, tool_choice)
 
         return session_create_request
 
@@ -924,6 +1497,10 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
         for tool in tools:
             if not isinstance(tool, FunctionTool):
                 raise UserError(f"Tool {tool.name} is unsupported. Must be a function tool.")
+            ensure_function_tool_supports_responses_only_features(
+                tool,
+                backend_name="Realtime models",
+            )
             converted_tools.append(
                 OpenAISessionFunction(
                     name=tool.name,
@@ -948,6 +1525,42 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
 
 class OpenAIRealtimeSIPModel(OpenAIRealtimeWebSocketModel):
     """Realtime model that attaches to SIP-originated calls using a call ID."""
+
+    @staticmethod
+    async def build_initial_session_payload(
+        agent: RealtimeAgent[Any],
+        *,
+        context: TContext | None = None,
+        model_config: RealtimeModelConfig | None = None,
+        run_config: RealtimeRunConfig | None = None,
+        overrides: RealtimeSessionModelSettings | None = None,
+    ) -> OpenAISessionCreateRequest:
+        """Build a session payload that mirrors what a RealtimeSession would send on connect.
+
+        This helper can be used to accept SIP-originated calls by forwarding the returned payload to
+        the Realtime Calls API without duplicating session setup logic.
+        """
+        run_config_settings = (run_config or {}).get("model_settings") or {}
+        initial_model_settings = (model_config or {}).get("initial_model_settings") or {}
+        base_settings: RealtimeSessionModelSettings = {
+            **run_config_settings,
+            **initial_model_settings,
+        }
+
+        context_wrapper = RunContextWrapper(context)
+        merged_settings = await _build_model_settings_from_agent(
+            agent=agent,
+            context_wrapper=context_wrapper,
+            base_settings=base_settings,
+            starting_settings=initial_model_settings,
+            run_config=run_config,
+        )
+
+        if overrides:
+            merged_settings.update(overrides)
+
+        model = OpenAIRealtimeWebSocketModel()
+        return model._get_session_config(merged_settings)
 
     async def connect(self, options: RealtimeModelConfig) -> None:
         call_id = options.get("call_id")

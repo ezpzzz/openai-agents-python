@@ -19,6 +19,55 @@ We will increment `Z` for non-breaking changes:
 
 ## Breaking change changelog
 
+### 0.13.0
+
+This minor release does **not** introduce a breaking change, but it includes a notable Realtime default update plus new MCP capabilities and runtime stability fixes.
+
+Highlights:
+
+-   The default websocket Realtime model is now `gpt-realtime-1.5`, so new Realtime agent setups use the newer model without extra configuration.
+-   `MCPServer` now exposes `list_resources()`, `list_resource_templates()`, and `read_resource()`, and `MCPServerStreamableHttp` now exposes `session_id` so streamable HTTP sessions can be resumed across reconnects or stateless workers.
+-   Chat Completions integrations can now opt into reasoning-content replay via `should_replay_reasoning_content`, improving provider-specific reasoning/tool-call continuity for adapters such as LiteLLM/DeepSeek.
+-   Fixed several runtime and session edge cases, including concurrent first writes in `SQLAlchemySession`, compaction requests with orphaned assistant message IDs after reasoning stripping, `remove_all_tools()` leaving MCP/reasoning items behind, and a race in the function-tool batch executor.
+
+### 0.12.0
+
+This minor release does **not** introduce a breaking change. Check [the release notes](https://github.com/openai/openai-agents-python/releases/tag/v0.12.0) for major feature additions.
+
+### 0.11.0
+
+This minor release does **not** introduce a breaking change. Check [the release notes](https://github.com/openai/openai-agents-python/releases/tag/v0.11.0) for major feature additions.
+
+### 0.10.0
+
+This minor release does **not** introduce a breaking change, but it includes a significant new feature area for OpenAI Responses users: websocket transport support for the Responses API.
+
+Highlights:
+
+-   Added websocket transport support for OpenAI Responses models (opt-in; HTTP remains the default transport).
+-   Added a `responses_websocket_session()` helper / `ResponsesWebSocketSession` for reusing a shared websocket-capable provider and `RunConfig` across multi-turn runs.
+-   Added a new websocket streaming example (`examples/basic/stream_ws.py`) covering streaming, tools, approvals, and follow-up turns.
+
+### 0.9.0
+
+In this version, Python 3.9 is no longer supported, as this major version reached EOL three months ago. Please upgrade to a newer runtime version.
+
+Additionally, the type hint for the value returned from the `Agent#as_tool()` method has been narrowed from `Tool` to `FunctionTool`. This change should not usually cause breaking issues, but if your code relies on the broader union type, you may need to make some adjustments on your side.
+
+### 0.8.0
+
+In this version, two runtime behavior changes may require migration work:
+
+- Function tools wrapping **synchronous** Python callables now execute on worker threads via `asyncio.to_thread(...)` instead of running on the event loop thread. If your tool logic depends on thread-local state or thread-affine resources, migrate to an async tool implementation or make thread affinity explicit in your tool code.
+- Local MCP tool failure handling is now configurable, and the default behavior can return model-visible error output instead of failing the whole run. If you rely on fail-fast semantics, set `mcp_config={"failure_error_function": None}`. Server-level `failure_error_function` values override the agent-level setting, so set `failure_error_function=None` on each local MCP server that has an explicit handler.
+
+### 0.7.0
+
+In this version, there were a few behavior changes that can affect existing applications:
+
+- Nested handoff history is now **opt-in** (disabled by default). If you depended on the v0.6.x default nested behavior, explicitly set `RunConfig(nest_handoff_history=True)`.
+- The default `reasoning.effort` for `gpt-5.1` / `gpt-5.2` changed to `"none"` (from the previous default `"low"` configured by SDK defaults). If your prompts or quality/cost profile relied on `"low"`, set it explicitly in `model_settings`.
+
 ### 0.6.0
 
 In this version, the default handoff history is now packaged into a single assistant message instead of exposing the raw user/assistant turns, giving downstream agents a concise, predictable recap

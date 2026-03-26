@@ -75,6 +75,28 @@ class UserError(AgentsException):
         super().__init__(message)
 
 
+class MCPToolCancellationError(AgentsException):
+    """Exception raised when an MCP tool call is internally cancelled."""
+
+    message: str
+
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(message)
+
+
+class ToolTimeoutError(AgentsException):
+    """Exception raised when a function tool invocation exceeds its timeout."""
+
+    tool_name: str
+    timeout_seconds: float
+
+    def __init__(self, tool_name: str, timeout_seconds: float):
+        self.tool_name = tool_name
+        self.timeout_seconds = timeout_seconds
+        super().__init__(f"Tool '{tool_name}' timed out after {timeout_seconds:g} seconds.")
+
+
 class InputGuardrailTripwireTriggered(AgentsException):
     """Exception raised when a guardrail tripwire is triggered."""
 

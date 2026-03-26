@@ -4,10 +4,11 @@ The Agents SDK includes built-in tracing, collecting a comprehensive record of e
 
 !!!note
 
-    Tracing is enabled by default. There are two ways to disable tracing:
+    Tracing is enabled by default. You can disable it in three common ways:
 
     1. You can globally disable tracing by setting the env var `OPENAI_AGENTS_DISABLE_TRACING=1`
-    2. You can disable tracing for a single run by setting [`agents.run.RunConfig.tracing_disabled`][] to `True`
+    2. You can globally disable tracing in code with [`set_tracing_disabled(True)`][agents.set_tracing_disabled]
+    3. You can disable tracing for a single run by setting [`agents.run.RunConfig.tracing_disabled`][] to `True`
 
 ***For organizations operating under a Zero Data Retention (ZDR) policy using OpenAI's APIs, tracing is unavailable.***
 
@@ -85,6 +86,8 @@ The `generation_span()` stores the inputs/outputs of the LLM generation, and `fu
 
 Similarly, Audio spans include base64-encoded PCM data for input and output audio by default. You can disable capturing this audio data by configuring [`VoicePipelineConfig.trace_include_sensitive_audio_data`][agents.voice.pipeline_config.VoicePipelineConfig.trace_include_sensitive_audio_data].
 
+By default, `trace_include_sensitive_data` is `True`. You can set the default without code by exporting the `OPENAI_AGENTS_TRACE_INCLUDE_SENSITIVE_DATA` environment variable to `true/1` or `false/0` before running your app.
+
 ## Custom tracing processors
 
 The high level architecture for tracing is:
@@ -98,20 +101,20 @@ To customize this default setup, to send traces to alternative or additional bac
 2. [`set_trace_processors()`][agents.tracing.set_trace_processors] lets you **replace** the default processors with your own trace processors. This means traces will not be sent to the OpenAI backend unless you include a `TracingProcessor` that does so.
 
 
-## Tracing with Non-OpenAI Models
+## Tracing with non-OpenAI models
 
-You can use an OpenAI API key with non-OpenAI Models to enable free tracing in the OpenAI Traces dashboard without needing to disable tracing.
+You can use an OpenAI API key with non-OpenAI models to enable free tracing in the OpenAI Traces dashboard without needing to disable tracing. See the [Third-party adapters](models/index.md#third-party-adapters) section in the Models guide for adapter selection and setup caveats.
 
 ```python
 import os
 from agents import set_tracing_export_api_key, Agent, Runner
-from agents.extensions.models.litellm_model import LitellmModel
+from agents.extensions.models.any_llm_model import AnyLLMModel
 
 tracing_api_key = os.environ["OPENAI_API_KEY"]
 set_tracing_export_api_key(tracing_api_key)
 
-model = LitellmModel(
-    model="your-model-name",
+model = AnyLLMModel(
+    model="your-provider/your-model-name",
     api_key="your-api-key",
 )
 
@@ -121,11 +124,27 @@ agent = Agent(
 )
 ```
 
-## Notes
+If you only need a different tracing key for a single run, pass it via `RunConfig` instead of changing the global exporter.
+
+```python
+from agents import Runner, RunConfig
+
+await Runner.run(
+    agent,
+    input="Hello",
+    run_config=RunConfig(tracing={"api_key": "sk-tracing-123"}),
+)
+```
+
+## Additional notes
 - View free traces at Openai Traces dashboard.
 
 
-## External tracing processors list
+## Ecosystem integrations
+
+The following community and vendor integrations support the OpenAI Agents SDK tracing surface.
+
+### External tracing processors list
 
 -   [Weights & Biases](https://weave-docs.wandb.ai/guides/integrations/openai_agents)
 -   [Arize-Phoenix](https://docs.arize.com/phoenix/tracing/integrations-tracing/openai-agents-sdk)
@@ -136,7 +155,7 @@ agent = Agent(
 -   [Pydantic Logfire](https://logfire.pydantic.dev/docs/integrations/llms/openai/#openai-agents)
 -   [AgentOps](https://docs.agentops.ai/v1/integrations/agentssdk)
 -   [Scorecard](https://docs.scorecard.io/docs/documentation/features/tracing#openai-agents-sdk-integration)
--   [Keywords AI](https://docs.keywordsai.co/integration/development-frameworks/openai-agent)
+-   [Respan](https://respan.ai/docs/integrations/tracing/openai-agents-sdk)
 -   [LangSmith](https://docs.smith.langchain.com/observability/how_to_guides/trace_with_openai_agents_sdk)
 -   [Maxim AI](https://www.getmaxim.ai/docs/observe/integrations/openai-agents-sdk)
 -   [Comet Opik](https://www.comet.com/docs/opik/tracing/integrations/openai_agents)
@@ -147,4 +166,6 @@ agent = Agent(
 -   [Portkey AI](https://portkey.ai/docs/integrations/agents/openai-agents)
 -   [LangDB AI](https://docs.langdb.ai/getting-started/working-with-agent-frameworks/working-with-openai-agents-sdk)
 -   [Agenta](https://docs.agenta.ai/observability/integrations/openai-agents)
-
+-   [PostHog](https://posthog.com/docs/llm-analytics/installation/openai-agents)
+-   [Traccia](https://traccia.ai/docs/integrations/openai-agents)
+-   [PromptLayer](https://docs.promptlayer.com/languages/integrations#openai-agents-sdk)

@@ -7,6 +7,16 @@ There are two kinds of guardrails:
 1. Input guardrails run on the initial user input
 2. Output guardrails run on the final agent output
 
+## Workflow boundaries
+
+Guardrails are attached to agents and tools, but they do not all run at the same points in a workflow:
+
+-   **Input guardrails** run only for the first agent in the chain.
+-   **Output guardrails** run only for the agent that produces the final output.
+-   **Tool guardrails** run on every custom function-tool invocation, with input guardrails before execution and output guardrails after execution.
+
+If you need checks around each custom function-tool call in a workflow that includes managers, handoffs, or delegated specialists, use tool guardrails instead of relying only on agent-level input/output guardrails.
+
 ## Input guardrails
 
 Input guardrails run in 3 steps:
@@ -40,6 +50,16 @@ Output guardrails run in 3 steps:
     Output guardrails are intended to run on the final agent output, so an agent's guardrails only run if the agent is the *last* agent. Similar to the input guardrails, we do this because guardrails tend to be related to the actual Agent - you'd run different guardrails for different agents, so colocating the code is useful for readability.
 
     Output guardrails always run after the agent completes, so they don't support the `run_in_parallel` parameter.
+
+## Tool guardrails
+
+Tool guardrails wrap **function tools** and let you validate or block tool calls before and after execution. They are configured on the tool itself and run every time that tool is invoked.
+
+- Input tool guardrails run before the tool executes and can skip the call, replace the output with a message, or raise a tripwire.
+- Output tool guardrails run after the tool executes and can replace the output or raise a tripwire.
+- Tool guardrails apply only to function tools created with [`function_tool`][agents.tool.function_tool]. Handoffs run through the SDK's handoff pipeline rather than the normal function-tool pipeline, so tool guardrails do not apply to the handoff call itself. Hosted tools (`WebSearchTool`, `FileSearchTool`, `HostedMCPTool`, `CodeInterpreterTool`, `ImageGenerationTool`) and built-in execution tools (`ComputerTool`, `ShellTool`, `ApplyPatchTool`, `LocalShellTool`) also do not use this guardrail pipeline, and [`Agent.as_tool()`][agents.agent.Agent.as_tool] does not currently expose tool-guardrail options directly.
+
+See the code snippet below for details.
 
 ## Tripwires
 
@@ -162,3 +182,48 @@ async def main():
 2. This is the guardrail's output type.
 3. This is the guardrail function that receives the agent's output, and returns the result.
 4. This is the actual agent that defines the workflow.
+
+Lastly, here are examples of tool guardrails.
+
+```python
+import json
+from agents import (
+    Agent,
+    Runner,
+    ToolGuardrailFunctionOutput,
+    function_tool,
+    tool_input_guardrail,
+    tool_output_guardrail,
+)
+
+@tool_input_guardrail
+def block_secrets(data):
+    args = json.loads(data.context.tool_arguments or "{}")
+    if "sk-" in json.dumps(args):
+        return ToolGuardrailFunctionOutput.reject_content(
+            "Remove secrets before calling this tool."
+        )
+    return ToolGuardrailFunctionOutput.allow()
+
+
+@tool_output_guardrail
+def redact_output(data):
+    text = str(data.output or "")
+    if "sk-" in text:
+        return ToolGuardrailFunctionOutput.reject_content("Output contained sensitive data.")
+    return ToolGuardrailFunctionOutput.allow()
+
+
+@function_tool(
+    tool_input_guardrails=[block_secrets],
+    tool_output_guardrails=[redact_output],
+)
+def classify_text(text: str) -> str:
+    """Classify text for internal routing."""
+    return f"length:{len(text)}"
+
+
+agent = Agent(name="Classifier", tools=[classify_text])
+result = Runner.run_sync(agent, "hello world")
+print(result.final_output)
+```

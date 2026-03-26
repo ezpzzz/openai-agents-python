@@ -3,7 +3,9 @@ from __future__ import annotations
 import gc
 import json
 import weakref
+from typing import Any, cast
 
+from openai.types.responses.computer_action import Click as BatchedClick, Type as BatchedType
 from openai.types.responses.response_computer_tool_call import (
     ActionScreenshot,
     ResponseComputerToolCall,
@@ -20,6 +22,7 @@ from openai.types.responses.response_function_web_search import (
     ResponseFunctionWebSearch,
 )
 from openai.types.responses.response_function_web_search_param import ResponseFunctionWebSearchParam
+from openai.types.responses.response_input_item_param import ResponseInputItemParam
 from openai.types.responses.response_output_message import ResponseOutputMessage
 from openai.types.responses.response_output_message_param import ResponseOutputMessageParam
 from openai.types.responses.response_output_refusal import ResponseOutputRefusal
@@ -27,6 +30,8 @@ from openai.types.responses.response_output_text import ResponseOutputText
 from openai.types.responses.response_output_text_param import ResponseOutputTextParam
 from openai.types.responses.response_reasoning_item import ResponseReasoningItem, Summary
 from openai.types.responses.response_reasoning_item_param import ResponseReasoningItemParam
+from openai.types.responses.response_tool_search_call import ResponseToolSearchCall
+from openai.types.responses.response_tool_search_output_item import ResponseToolSearchOutputItem
 from pydantic import TypeAdapter
 
 from agents import (
@@ -40,6 +45,7 @@ from agents import (
     TResponseInputItem,
     Usage,
 )
+from agents.items import ToolCallItem, ToolCallOutputItem
 
 
 def make_message(
@@ -99,6 +105,27 @@ def test_extract_last_text_returns_text_only() -> None:
     # Whereas when last content is a refusal, extract_last_text returns None.
     message2 = make_message([first_text, ResponseOutputRefusal(refusal="no", type="refusal")])
     assert ItemHelpers.extract_last_text(message2) is None
+
+
+def test_extract_text_concatenates_all_text_segments() -> None:
+    first_text = ResponseOutputText(annotations=[], text="part1", type="output_text", logprobs=[])
+    second_text = ResponseOutputText(annotations=[], text="part2", type="output_text", logprobs=[])
+    refusal = ResponseOutputRefusal(refusal="no", type="refusal")
+    message = make_message([first_text, refusal, second_text])
+
+    assert ItemHelpers.extract_text(message) == "part1part2"
+    assert (
+        ItemHelpers.extract_text(
+            ResponseFunctionToolCall(
+                id="tool123",
+                arguments="{}",
+                call_id="call123",
+                name="func",
+                type="function_call",
+            )
+        )
+        is None
+    )
 
 
 def test_input_to_new_input_list_from_string() -> None:
@@ -207,6 +234,72 @@ def test_handoff_output_item_retains_agents_until_gc() -> None:
     assert item.agent is None
     assert item.source_agent is None
     assert item.target_agent is None
+
+
+def test_handoff_output_item_converts_protocol_payload() -> None:
+    raw_item = cast(
+        TResponseInputItem,
+        {
+            "type": "function_call_output",
+            "call_id": "call-123",
+            "output": "ok",
+        },
+    )
+    owner_agent = Agent(name="owner")
+    source_agent = Agent(name="source")
+    target_agent = Agent(name="target")
+    item = HandoffOutputItem(
+        agent=owner_agent,
+        raw_item=raw_item,
+        source_agent=source_agent,
+        target_agent=target_agent,
+    )
+
+    converted = item.to_input_item()
+    assert converted["type"] == "function_call_output"
+    assert converted["call_id"] == "call-123"
+    assert converted["output"] == "ok"
+
+
+def test_handoff_output_item_stringifies_object_output() -> None:
+    raw_item = cast(
+        TResponseInputItem,
+        {
+            "type": "function_call_output",
+            "call_id": "call-obj",
+            "output": {"assistant": "Weather Assistant"},
+        },
+    )
+    owner_agent = Agent(name="owner")
+    source_agent = Agent(name="source")
+    target_agent = Agent(name="target")
+    item = HandoffOutputItem(
+        agent=owner_agent,
+        raw_item=raw_item,
+        source_agent=source_agent,
+        target_agent=target_agent,
+    )
+
+    converted = item.to_input_item()
+    assert converted["type"] == "function_call_output"
+    assert converted["call_id"] == "call-obj"
+    assert isinstance(converted["output"], dict)
+    assert converted["output"] == {"assistant": "Weather Assistant"}
+
+
+def test_tool_call_output_item_preserves_function_output_structure() -> None:
+    agent = Agent(name="tester")
+    raw_item = {
+        "type": "function_call_output",
+        "call_id": "call-keep",
+        "output": [{"type": "output_text", "text": "value"}],
+    }
+    item = ToolCallOutputItem(agent=agent, raw_item=raw_item, output="value")
+
+    payload = item.to_input_item()
+    assert isinstance(payload, dict)
+    assert payload["type"] == "function_call_output"
+    assert payload["output"] == raw_item["output"]
 
 
 def test_tool_call_output_item_constructs_function_call_output_dict():
@@ -347,6 +440,35 @@ def test_to_input_items_for_computer_call_click() -> None:
     assert converted_dict == expected
 
 
+def test_to_input_items_for_computer_call_batched_actions() -> None:
+    """A batched computer call should preserve its actions list when replayed as input."""
+    comp_call = ResponseComputerToolCall(
+        id="comp2",
+        actions=[
+            BatchedClick(type="click", x=3, y=4, button="left"),
+            BatchedType(type="type", text="hello"),
+        ],
+        type="computer_call",
+        call_id="comp2",
+        pending_safety_checks=[],
+        status="completed",
+    )
+    resp = ModelResponse(output=[comp_call], usage=Usage(), response_id=None)
+    input_items = resp.to_input_items()
+    assert isinstance(input_items, list) and len(input_items) == 1
+    assert input_items[0] == {
+        "id": "comp2",
+        "type": "computer_call",
+        "actions": [
+            {"type": "click", "x": 3, "y": 4, "button": "left"},
+            {"type": "type", "text": "hello"},
+        ],
+        "call_id": "comp2",
+        "pending_safety_checks": [],
+        "status": "completed",
+    }
+
+
 def test_to_input_items_for_reasoning() -> None:
     """A reasoning output should produce the same dict as a reasoning input item."""
     rc = Summary(text="why", type="summary_text")
@@ -366,8 +488,54 @@ def test_to_input_items_for_reasoning() -> None:
     assert converted_dict == expected
 
 
+def test_to_input_items_for_tool_search_strips_created_by() -> None:
+    """Tool-search output items should reuse the replay sanitizer before round-tripping."""
+    tool_search_call = ResponseToolSearchCall(
+        id="tsc_123",
+        call_id="call_tsc_123",
+        arguments={"query": "profile"},
+        execution="server",
+        status="completed",
+        type="tool_search_call",
+        created_by="server",
+    )
+    tool_search_output = ResponseToolSearchOutputItem(
+        id="tso_123",
+        call_id="call_tsc_123",
+        execution="server",
+        status="completed",
+        tools=[],
+        type="tool_search_output",
+        created_by="server",
+    )
+
+    resp = ModelResponse(
+        output=[tool_search_call, tool_search_output], usage=Usage(), response_id=None
+    )
+    input_items = resp.to_input_items()
+
+    assert input_items == [
+        {
+            "id": "tsc_123",
+            "call_id": "call_tsc_123",
+            "arguments": {"query": "profile"},
+            "execution": "server",
+            "status": "completed",
+            "type": "tool_search_call",
+        },
+        {
+            "id": "tso_123",
+            "call_id": "call_tsc_123",
+            "execution": "server",
+            "status": "completed",
+            "tools": [],
+            "type": "tool_search_output",
+        },
+    ]
+
+
 def test_input_to_new_input_list_copies_the_ones_produced_by_pydantic() -> None:
-    # Given a list of message dictionaries, ensure the returned list is a deep copy.
+    """Validated input items should be copied and made JSON dump compatible."""
     original = ResponseOutputMessageParam(
         id="a75654dc-7492-4d1c-bce0-89e8312fbdd7",
         content=[
@@ -382,17 +550,47 @@ def test_input_to_new_input_list_copies_the_ones_produced_by_pydantic() -> None:
         status="completed",
         type="message",
     )
-    original_json = json.dumps(original)
-    output_item = TypeAdapter(ResponseOutputMessageParam).validate_json(original_json)
-    new_list = ItemHelpers.input_to_new_input_list([output_item])
+    validated = TypeAdapter(list[ResponseInputItemParam]).validate_python([original])
+
+    new_list = ItemHelpers.input_to_new_input_list(validated)
     assert len(new_list) == 1
     assert new_list[0]["id"] == original["id"]  # type: ignore
-    size = 0
-    for i, item in enumerate(original["content"]):
-        size += 1  # pydantic_core._pydantic_core.ValidatorIterator does not support len()
-        assert item["type"] == original["content"][i]["type"]  # type: ignore
-        assert item["text"] == original["content"][i]["text"]  # type: ignore
-    assert size == 1
     assert new_list[0]["role"] == original["role"]  # type: ignore
     assert new_list[0]["status"] == original["status"]  # type: ignore
     assert new_list[0]["type"] == original["type"]
+    assert isinstance(new_list[0]["content"], list)
+
+    first_content = cast(dict[str, object], new_list[0]["content"][0])
+    assert first_content["type"] == "output_text"
+    assert first_content["text"] == "Hey, what's up?"
+    assert isinstance(first_content["annotations"], list)
+    assert isinstance(first_content["logprobs"], list)
+
+    # This used to fail when validated payloads retained ValidatorIterator fields.
+    json.dumps(new_list)
+
+
+def test_tool_call_item_to_input_item_keeps_payload_api_safe() -> None:
+    agent = Agent(name="test", instructions="test")
+    raw_item = ResponseFunctionToolCall(
+        id="fc_1",
+        call_id="call_1",
+        name="my_tool",
+        arguments="{}",
+        type="function_call",
+        status="completed",
+    )
+    item = ToolCallItem(
+        agent=agent,
+        raw_item=raw_item,
+        title="My Tool",
+        description="A helpful tool",
+    )
+
+    result = item.to_input_item()
+    result_dict = cast(dict[str, Any], result)
+
+    assert isinstance(result, dict)
+    assert result_dict["type"] == "function_call"
+    assert "title" not in result_dict
+    assert "description" not in result_dict

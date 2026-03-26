@@ -25,7 +25,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+import threading
+from typing import Any, ClassVar
 
 from sqlalchemy import (
     TIMESTAMP,
@@ -43,18 +44,39 @@ from sqlalchemy import (
     text as sql_text,
     update,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
 from ...items import TResponseInputItem
 from ...memory.session import SessionABC
+from ...memory.session_settings import SessionSettings, resolve_session_limit
 
 
 class SQLAlchemySession(SessionABC):
     """SQLAlchemy implementation of :pyclass:`agents.memory.session.Session`."""
 
+    _table_init_locks: ClassVar[dict[tuple[str, str, str], threading.Lock]] = {}
+    _table_init_locks_guard: ClassVar[threading.Lock] = threading.Lock()
     _metadata: MetaData
     _sessions: Table
     _messages: Table
+    session_settings: SessionSettings | None = None
+
+    @classmethod
+    def _get_table_init_lock(
+        cls, engine: AsyncEngine, sessions_table: str, messages_table: str
+    ) -> threading.Lock:
+        lock_key = (
+            engine.url.render_as_string(hide_password=True),
+            sessions_table,
+            messages_table,
+        )
+        with cls._table_init_locks_guard:
+            lock = cls._table_init_locks.get(lock_key)
+            if lock is None:
+                lock = threading.Lock()
+                cls._table_init_locks[lock_key] = lock
+            return lock
 
     def __init__(
         self,
@@ -64,6 +86,7 @@ class SQLAlchemySession(SessionABC):
         create_tables: bool = False,
         sessions_table: str = "agent_sessions",
         messages_table: str = "agent_messages",
+        session_settings: SessionSettings | None = None,
     ):
         """Initializes a new SQLAlchemySession.
 
@@ -77,10 +100,16 @@ class SQLAlchemySession(SessionABC):
                 development and testing when migrations aren't used.
             sessions_table (str, optional): Override the default table name for sessions if needed.
             messages_table (str, optional): Override the default table name for messages if needed.
+            session_settings (SessionSettings | None, optional): Session configuration settings
         """
         self.session_id = session_id
+        self.session_settings = session_settings or SessionSettings()
         self._engine = engine
-        self._lock = asyncio.Lock()
+        self._init_lock = (
+            self._get_table_init_lock(engine, sessions_table, messages_table)
+            if create_tables
+            else None
+        )
 
         self._metadata = MetaData()
         self._sessions = Table(
@@ -142,6 +171,7 @@ class SQLAlchemySession(SessionABC):
         *,
         url: str,
         engine_kwargs: dict[str, Any] | None = None,
+        session_settings: SessionSettings | None = None,
         **kwargs: Any,
     ) -> SQLAlchemySession:
         """Create a session from a database URL string.
@@ -151,6 +181,8 @@ class SQLAlchemySession(SessionABC):
             url (str): Any SQLAlchemy async URL, e.g. "postgresql+asyncpg://user:pass@host/db".
             engine_kwargs (dict[str, Any] | None): Additional keyword arguments forwarded to
                 sqlalchemy.ext.asyncio.create_async_engine.
+            session_settings (SessionSettings | None): Session configuration settings including
+                default limit for retrieving items. If None, uses default SessionSettings().
             **kwargs: Additional keyword arguments forwarded to the main constructor
                 (e.g., create_tables, custom table names, etc.).
 
@@ -173,7 +205,7 @@ class SQLAlchemySession(SessionABC):
             engine_kwargs["connect_args"]["statement_cache_size"] = 0
 
         engine = create_async_engine(url, **engine_kwargs)
-        return cls(session_id, engine=engine, **kwargs)
+        return cls(session_id, engine=engine, session_settings=session_settings, **kwargs)
 
     async def _serialize_item(self, item: TResponseInputItem) -> str:
         """Serialize an item to JSON string. Can be overridden by subclasses."""
@@ -188,24 +220,40 @@ class SQLAlchemySession(SessionABC):
     # ------------------------------------------------------------------
     async def _ensure_tables(self) -> None:
         """Ensure tables are created before any database operations."""
-        if self._create_tables:
+        if not self._create_tables:
+            return
+
+        assert self._init_lock is not None
+        while not self._init_lock.acquire(blocking=False):
+            # Poll without handing lock acquisition to a background thread so
+            # cancellation cannot strand the shared init lock in the acquired state.
+            await asyncio.sleep(0.01)
+        try:
+            if not self._create_tables:
+                return
+
             async with self._engine.begin() as conn:
                 await conn.run_sync(self._metadata.create_all)
             self._create_tables = False  # Only create once
+        finally:
+            self._init_lock.release()
 
     async def get_items(self, limit: int | None = None) -> list[TResponseInputItem]:
         """Retrieve the conversation history for this session.
 
         Args:
-            limit: Maximum number of items to retrieve. If None, retrieves all items.
+            limit: Maximum number of items to retrieve. If None, uses session_settings.limit.
                    When specified, returns the latest N items in chronological order.
 
         Returns:
             List of input items representing the conversation history
         """
         await self._ensure_tables()
+
+        session_limit = resolve_session_limit(limit, self.session_settings)
+
         async with self._session_factory() as sess:
-            if limit is None:
+            if session_limit is None:
                 stmt = (
                     select(self._messages.c.message_data)
                     .where(self._messages.c.session_id == self.session_id)
@@ -224,13 +272,13 @@ class SQLAlchemySession(SessionABC):
                         self._messages.c.created_at.desc(),
                         self._messages.c.id.desc(),
                     )
-                    .limit(limit)
+                    .limit(session_limit)
                 )
 
             result = await sess.execute(stmt)
             rows: list[str] = [row[0] for row in result.all()]
 
-            if limit is not None:
+            if session_limit is not None:
                 rows.reverse()
 
             items: list[TResponseInputItem] = []
@@ -262,18 +310,22 @@ class SQLAlchemySession(SessionABC):
 
         async with self._session_factory() as sess:
             async with sess.begin():
-                # Ensure the parent session row exists - use merge for cross-DB compatibility
-                # Check if session exists
+                # Avoid check-then-insert races on the first write while keeping
+                # the common path free of avoidable integrity exceptions.
                 existing = await sess.execute(
                     select(self._sessions.c.session_id).where(
                         self._sessions.c.session_id == self.session_id
                     )
                 )
                 if not existing.scalar_one_or_none():
-                    # Session doesn't exist, create it
-                    await sess.execute(
-                        insert(self._sessions).values({"session_id": self.session_id})
-                    )
+                    try:
+                        async with sess.begin_nested():
+                            await sess.execute(
+                                insert(self._sessions).values({"session_id": self.session_id})
+                            )
+                    except IntegrityError:
+                        # Another concurrent writer created the parent row first.
+                        pass
 
                 # Insert messages in bulk
                 await sess.execute(insert(self._messages), payload)

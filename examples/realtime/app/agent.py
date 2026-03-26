@@ -38,7 +38,7 @@ async def faq_lookup_tool(question: str) -> str:
     return "I'm sorry, I don't know the answer to that question."
 
 
-@function_tool
+@function_tool(needs_approval=True)
 async def update_seat(confirmation_number: str, new_seat: str) -> str:
     """
     Update the seat for a given confirmation number.
@@ -90,6 +90,7 @@ triage_agent = RealtimeAgent(
         f"{RECOMMENDED_PROMPT_PREFIX} "
         "You are a helpful triaging agent. You can use your tools to delegate questions to other appropriate agents."
     ),
+    tools=[get_weather],
     handoffs=[faq_agent, realtime_handoff(seat_booking_agent)],
 )
 

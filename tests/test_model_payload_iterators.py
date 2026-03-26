@@ -7,7 +7,6 @@ import httpx
 import pytest
 from openai import omit
 from openai.types.chat.chat_completion import ChatCompletion
-from openai.types.responses import ToolParam
 
 from agents import (
     ModelSettings,
@@ -60,7 +59,7 @@ async def test_chat_completions_materializes_iterator_payload(
     monkeypatch.setattr(
         chat_converter,
         "items_to_messages",
-        classmethod(lambda _cls, _input: [{"role": "user", "content": message_iter}]),
+        classmethod(lambda _cls, _input, **kwargs: [{"role": "user", "content": message_iter}]),
     )
     monkeypatch.setattr(
         chat_converter,
@@ -135,22 +134,22 @@ async def test_responses_materializes_iterator_payload(monkeypatch: pytest.Monke
     )
 
     converted_tools = responses_module.ConvertedTools(
-        tools=cast(
-            list[ToolParam],
-            [
+        tools=[
+            cast(
+                Any,
                 {
                     "type": "function",
                     "name": "dummy",
                     "parameters": {"properties": tool_iter},
-                }
-            ],
-        ),
+                },
+            )
+        ],
         includes=[],
     )
     monkeypatch.setattr(
         responses_converter,
         "convert_tools",
-        classmethod(lambda _cls, _tools, _handoffs: converted_tools),
+        classmethod(lambda _cls, _tools, _handoffs, **_kwargs: converted_tools),
     )
 
     captured_kwargs: dict[str, Any] = {}
